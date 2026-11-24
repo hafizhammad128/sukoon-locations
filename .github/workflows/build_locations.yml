@@ -1,0 +1,44 @@
+
+name: Build Sukoon Location Dataset
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-locations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check Python syntax
+        run: python -m py_compile build_locations.py
+
+      - name: Build offline location dataset
+        run: python -u build_locations.py
+
+      - name: Verify generated files
+        run: |
+          test -s assets/locations/countries.json
+          test -s assets/locations/PK.json
+          ls -lh assets/locations/
+          du -sh assets/locations/
+
+      - name: Upload offline location files
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukoon-offline-locations
+          path: assets/locations/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

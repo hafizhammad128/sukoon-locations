@@ -1,0 +1,196 @@
+
+name: Download Global Administrative Data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download-admin-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Download country datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import zipfile
+          import io
+          from pathlib import Path
+
+          root = Path("admin_data")
+          root.mkdir(exist_ok=True)
+
+          token = os.environ["GH_TOKEN"]
+          org = "open-admin-data"
+
+          def api(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "Sukoon-Locations"
+                  }
+              )
+              with urllib.request.urlopen(
+                  req, timeout=120
+              ) as response:
+                  return json.load(response)
+
+          repositories = []
+          page = 1
+
+          while True:
+              batch = api(
+                  f"https://api.github.com/orgs/{org}/repos"
+                  f"?per_page=100&page={page}"
+              )
+              if not batch:
+                  break
+              repositories.extend(batch)
+              page += 1
+
+          report = {
+              "repositories_found": len(repositories),
+              "downloaded": [],
+              "failed": [],
+              "skipped": []
+          }
+
+          print("Repositories:", len(repositories))
+
+          for repo in repositories:
+              name = repo["name"]
+
+              if not name.endswith(
+                  "-administrative-divisions"
+              ):
+                  report["skipped"].append(name)
+                  continue
+
+              try:
+                  branch = repo["default_branch"]
+
+                  url = (
+                      f"https://codeload.github.com/"
+                      f"{org}/{name}/zip/refs/heads/{branch}"
+                  )
+
+                  print("Downloading:", name, flush=True)
+
+                  with urllib.request.urlopen(
+                      url, timeout=180
+                  ) as response:
+                      archive = response.read()
+
+                  destination = root / name
+                  destination.mkdir(exist_ok=True)
+                  files = []
+
+                  with zipfile.ZipFile(
+                      io.BytesIO(archive)
+                  ) as z:
+                      for item in z.infolist():
+                          if item.is_dir():
+                              continue
+
+                          parts = Path(item.filename).parts[1:]
+
+                          if not parts or ".." in parts:
+                              continue
+
+                          rel = Path(*parts)
+                          filename = rel.name.lower()
+
+                          is_json = (
+                              rel.suffix.lower() == ".json"
+                              and "data" in rel.parts
+                          )
+
+                          is_documentation = (
+                              filename.startswith("license")
+                              or filename.startswith("readme")
+                              or filename.startswith("citation")
+                              or filename.startswith("notice")
+                          )
+
+                          if not (
+                              is_json or is_documentation
+                          ):
+                              continue
+
+                          target = destination / rel
+                          target.parent.mkdir(
+                              parents=True,
+                              exist_ok=True
+                          )
+
+                          content = z.read(item)
+
+                          if is_json:
+                              json.loads(content)
+
+                          target.write_bytes(content)
+                          files.append(str(rel))
+
+                  if not any(
+                      f.endswith(".json") for f in files
+                  ):
+                      raise ValueError("No data JSON found")
+
+                  report["downloaded"].append({
+                      "repository": name,
+                      "source": repo["html_url"],
+                      "branch": branch,
+                      "files": files
+                  })
+
+                  print("SUCCESS:", name, len(files))
+
+              except Exception as error:
+                  report["failed"].append({
+                      "repository": name,
+                      "error": str(error)
+                  })
+                  print("FAILED:", name, str(error))
+
+          report["successful_count"] = len(
+              report["downloaded"]
+          )
+          report["failed_count"] = len(
+              report["failed"]
+          )
+
+          Path("admin_data_report.json").write_text(
+              json.dumps(report, indent=2),
+              encoding="utf-8"
+          )
+
+          print("FINAL DOWNLOAD REPORT")
+          print("Repositories:", len(repositories))
+          print("Successful:", report["successful_count"])
+          print("Failed:", report["failed_count"])
+          print("Skipped:", len(report["skipped"]))
+
+          if not report["downloaded"]:
+              raise RuntimeError("No datasets downloaded")
+          PY
+
+      - name: Upload administrative datasets
+        uses: actions/upload-artifact@v4
+        with:
+          name: global-administrative-data
+          path: |
+            admin_data/
+            admin_data_report.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

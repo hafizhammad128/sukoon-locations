@@ -1,0 +1,376 @@
+name: Build Sukoon Final Locations
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-locations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Download previous datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p inputs/base inputs/v5
+
+          for ITEM in \
+            "sukoon-locations-v4-candidate:base" \
+            "sukoon-locations-v5-candidate:v5"
+          do
+            NAME="${ITEM%%:*}"
+            DIR="${ITEM##*:}"
+
+            ID=$(gh api --paginate \
+              "repos/$REPO/actions/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"$NAME\" and .expired == false) | .id" \
+              | sed -n '1p')
+
+            test -n "$ID"
+
+            gh api \
+              "repos/$REPO/actions/artifacts/$ID/zip" \
+              > "$DIR.zip"
+
+            unzip -q "$DIR.zip" -d "inputs/$DIR"
+          done
+
+      - name: Install Google phone metadata
+        run: |
+          python3 -m pip install phonenumbers==9.0.44
+
+      - name: Prepare offline location files
+        run: |
+          python3 - <<'PY'
+          import json
+          import shutil
+          import unicodedata
+          import phonenumbers
+
+          from pathlib import Path
+          from collections import Counter
+
+          def read(path):
+              return json.loads(
+                  path.read_text(encoding="utf-8")
+              )
+
+          def write(path, data):
+              path.write_text(
+                  json.dumps(
+                      data,
+                      ensure_ascii=False,
+                      separators=(",", ":")
+                  ),
+                  encoding="utf-8"
+              )
+
+          def norm(value):
+              return unicodedata.normalize(
+                  "NFKC", str(value or "")
+              ).strip().casefold()
+
+          def records(data):
+              yield from data["provinces"]
+
+              for group in data["districts"].values():
+                  yield from group
+
+              for group in data["tehsils"].values():
+                  yield from group
+
+          base = next(
+              Path("inputs/base").rglob("countries.json")
+          ).parent
+
+          v5 = next(
+              Path("inputs/v5").rglob("countries.json")
+          ).parent
+
+          output = Path("assets/locations")
+
+          shutil.copytree(base, output)
+
+          countries = read(output / "countries.json")
+
+          totals = Counter()
+          phones = {}
+          missing_codes = []
+          review = []
+          localized = 0
+
+          for country in countries:
+              iso = country["code"]
+
+              path = output / f"{iso}.json"
+
+              data = read(path)
+              newer = read(v5 / f"{iso}.json")
+
+              old_records = list(records(data))
+              new_records = list(records(newer))
+
+              new_index = {}
+
+              for item in new_records:
+                  key = item["code"]
+
+                  if key in new_index:
+                      raise ValueError(
+                          f"Duplicate V5 code: {iso} {key}"
+                      )
+
+                  new_index[key] = item
+
+              old_ids = {
+                  item["code"] for item in old_records
+              }
+
+              # Preserve V5 additions for later review.
+              additions = [
+                  item for item in new_records
+                  if item["code"] not in old_ids
+              ]
+
+              if additions:
+                  review.append({
+                      "country": iso,
+                      "additional_records": len(additions)
+                  })
+
+              # Reuse localized names only for
+              # unchanged records with matching IDs.
+              country_localized = 0
+
+              for item in old_records:
+                  candidate = new_index.get(item["code"])
+
+                  if not candidate:
+                      continue
+
+                  if norm(item.get("name")) != norm(
+                      candidate.get("name")
+                  ):
+                      continue
+
+                  if item.get("level") != candidate.get("level"):
+                      continue
+
+                  if any(
+                      item.get(key) != candidate.get(key)
+                      for key in (
+                          "province_code",
+                          "district_code"
+                      )
+                  ):
+                      continue
+
+                  local = candidate.get("name_local")
+
+                  if local and not item.get("name_local"):
+                      item["name_local"] = local
+                      localized += 1
+                      country_localized += 1
+
+              if country_localized:
+                  source_license = (
+                      v5 / "licenses" / f"{iso}-LICENSE.txt"
+                  )
+
+                  if not source_license.exists():
+                      raise ValueError(
+                          f"Missing attribution license: {iso}"
+                      )
+
+                  target = (
+                      output / "licenses" / f"{iso}-LICENSE.txt"
+                  )
+
+                  target.parent.mkdir(
+                      parents=True, exist_ok=True
+                  )
+
+                  shutil.copyfile(source_license, target)
+
+                  with (output / "ATTRIBUTION.txt").open(
+                      "a", encoding="utf-8"
+                  ) as f:
+                      for url in newer.get(
+                          "additional_sources", []
+                      ):
+                          f.write(
+                              f"\n{iso}: {url}\n"
+                              "Localized names reused.\n"
+                              f"License: licenses/{iso}-LICENSE.txt\n"
+                          )
+
+              # Validate linked hierarchy.
+              province_ids = {
+                  item["code"]
+                  for item in data["provinces"]
+              }
+
+              assert len(province_ids) == len(
+                  data["provinces"]
+              )
+
+              seen = set(province_ids)
+              district_ids = set()
+
+              for province, group in data["districts"].items():
+                  assert province in province_ids
+
+                  for item in group:
+                      rid = item["code"]
+                      assert rid not in seen
+
+                      seen.add(rid)
+                      district_ids.add(rid)
+
+              for district, group in data["tehsils"].items():
+                  assert district in district_ids
+
+                  for item in group:
+                      rid = item["code"]
+                      assert rid not in seen
+                      seen.add(rid)
+
+              # Unlinked records remain preserved,
+              # but are not offered in the picker.
+              counts = {
+                  "provinces": len(province_ids),
+                  "districts": len(district_ids),
+                  "tehsils": sum(
+                      len(group)
+                      for group in data["tehsils"].values()
+                  )
+              }
+
+              data["counts"] = counts
+              country["counts"] = counts
+
+              for key, value in counts.items():
+                  totals[key] += value
+                  country[f"has_{key}"] = value > 0
+
+              totals["unlinked_tehsils"] += len(
+                  data.get("unlinked_tehsils", [])
+              )
+
+              totals["unlinked_districts"] += len(
+                  data.get("unlinked_districts", [])
+              )
+
+              # Calling codes from Google metadata.
+              number = phonenumbers.country_code_for_region(
+                  iso
+              )
+
+              dial = f"+{number}" if number else ""
+
+              if not dial:
+                  missing_codes.append(iso)
+
+              country["dial"] = dial
+              country["dial_codes"] = [dial] if dial else []
+
+              data["country"]["dial"] = dial
+              data["country"]["dial_codes"] = (
+                  country["dial_codes"]
+              )
+
+              phones[iso] = {
+                  "name": country["name"],
+                  "dial": dial,
+                  "dial_codes": country["dial_codes"]
+              }
+
+              write(path, data)
+
+              print(
+                  iso,
+                  country["name"],
+                  dial,
+                  counts
+              )
+
+          countries.sort(
+              key=lambda item: item["name"].casefold()
+          )
+
+          assert len(countries) == 250
+
+          pk = read(output / "PK.json")
+
+          assert pk["counts"] == {
+              "provinces": 7,
+              "districts": 160,
+              "tehsils": 577
+          }
+
+          assert phones["PK"]["dial"] == "+92"
+          assert phones["IN"]["dial"] == "+91"
+          assert phones["SA"]["dial"] == "+966"
+          assert phones["GB"]["dial"] == "+44"
+          assert phones["US"]["dial"] == "+1"
+
+          write(
+              output / "countries.json",
+              countries
+          )
+
+          write(
+              output / "dialing_codes.json",
+              phones
+          )
+
+          write(
+              output / "preserved_v5_review.json",
+              review
+          )
+
+          summary = {
+              "app": "Sukoon Matrimonial",
+              "dataset_version": "final-base-candidate",
+              "schema_version": 2,
+              "countries": len(countries),
+              **dict(totals),
+              "pakistan": pk["counts"],
+              "localized_names_reused": localized,
+              "v5_additions_for_review": sum(
+                  item["additional_records"]
+                  for item in review
+              ),
+              "countries_without_dial_code": missing_codes,
+              "linked_hierarchy_validation": "passed",
+              "release_ready": False
+          }
+
+          write(
+              output / "dataset_summary.json",
+              summary
+          )
+
+          print("SUKOON FINAL LOCATION REPORT")
+
+          print(json.dumps(
+              summary,
+              ensure_ascii=False,
+              indent=2
+          ))
+          PY
+
+      - name: Upload offline location dataset
+        uses: actions/upload-artifact@v7
+        with:
+          name: sukoon-final-location-base
+          path: assets/locations/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 6

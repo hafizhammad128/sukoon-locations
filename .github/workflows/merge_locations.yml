@@ -1,0 +1,387 @@
+
+name: Merge Sukoon Location Dataset V3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  merge-locations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Download existing artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p inputs/geonames inputs/admin
+
+          for ITEM in \
+            "sukoon-offline-locations:geonames" \
+            "global-administrative-data:admin"
+          do
+            NAME="${ITEM%%:*}"
+            DIR="${ITEM##*:}"
+
+            ID=$(gh api --paginate \
+              "repos/$REPO/actions/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"$NAME\" and .expired == false) | .id" \
+              | head -n 1)
+
+            test -n "$ID"
+
+            gh api \
+              "repos/$REPO/actions/artifacts/$ID/zip" \
+              > "$DIR.zip"
+
+            unzip -q "$DIR.zip" -d "inputs/$DIR"
+          done
+
+      - name: Install phone metadata
+        run: python3 -m pip install phonenumbers
+
+      - name: Merge and validate location data
+        run: |
+          python3 - <<'PY'
+          import json
+          import shutil
+          import phonenumbers
+          from pathlib import Path
+          from collections import defaultdict
+
+          def read(path):
+              return json.loads(
+                  path.read_text(encoding="utf-8")
+              )
+
+          def write(path, data):
+              path.write_text(
+                  json.dumps(
+                      data,
+                      ensure_ascii=False,
+                      separators=(",", ":")
+                  ),
+                  encoding="utf-8"
+              )
+
+          base = next(
+              Path("inputs/geonames").rglob(
+                  "countries.json"
+              )
+          ).parent
+
+          output = Path("assets/locations")
+          output.mkdir(parents=True, exist_ok=True)
+
+          shutil.copytree(
+              base, output, dirs_exist_ok=True
+          )
+
+          countries = read(output / "countries.json")
+
+          pk_repo = next(
+              Path("inputs/admin").rglob(
+                  "pakistan-administrative-divisions"
+              )
+          )
+
+          pk_data = pk_repo / "data"
+
+          provinces_raw = read(
+              pk_data / "all-province.json"
+          )
+
+          districts_raw = read(
+              pk_data / "all-district.json"
+          )
+
+          tehsils_raw = read(
+              pk_data / "all-tehsil.json"
+          )
+
+          def convert(records, level):
+              result = {}
+
+              for record in records:
+                  assert record["level"] == level
+
+                  rid = str(record["id"])
+                  names = record["name"]
+                  parent = record.get("parent")
+
+                  assert rid not in result
+                  assert names.get("en")
+
+                  result[rid] = {
+                      "id": rid,
+                      "code": rid,
+                      "local_code": rid,
+                      "name": names["en"],
+                      "ascii_name": names["en"],
+                      "name_local": names.get("local", ""),
+                      "country_code": "PK",
+                      "level": level,
+                      "parent_id": (
+                          str(parent["id"])
+                          if parent else None
+                      ),
+                      "source": "Open Admin Data"
+                  }
+
+              return result
+
+          provinces = convert(provinces_raw, 1)
+          districts = convert(districts_raw, 2)
+          tehsils = convert(tehsils_raw, 3)
+
+          assert len(provinces) >= 7
+          assert len(districts) >= 160
+          assert len(tehsils) >= 577
+
+          all_ids = (
+              list(provinces)
+              + list(districts)
+              + list(tehsils)
+          )
+
+          assert len(all_ids) == len(set(all_ids))
+
+          district_groups = defaultdict(list)
+          tehsil_groups = defaultdict(list)
+
+          for district in districts.values():
+              parent = district["parent_id"]
+
+              if parent not in provinces:
+                  raise ValueError(
+                      "Invalid district parent: "
+                      + district["id"]
+                  )
+
+              district["province_code"] = parent
+              district_groups[parent].append(district)
+
+          for tehsil in tehsils.values():
+              parent = tehsil["parent_id"]
+
+              if parent not in districts:
+                  raise ValueError(
+                      "Invalid tehsil parent: "
+                      + tehsil["id"]
+                  )
+
+              tehsil["district_code"] = parent
+              tehsil["province_code"] = districts[
+                  parent
+              ]["province_code"]
+
+              tehsil_groups[parent].append(tehsil)
+
+          def sort_records(records):
+              return sorted(
+                  records,
+                  key=lambda item: item["name"].casefold()
+              )
+
+          pk = read(output / "PK.json")
+
+          pk["provinces"] = sort_records(
+              provinces.values()
+          )
+
+          pk["districts"] = {
+              key: sort_records(value)
+              for key, value in district_groups.items()
+          }
+
+          pk["tehsils"] = {
+              key: sort_records(value)
+              for key, value in tehsil_groups.items()
+          }
+
+          pk["unlinked_districts"] = []
+          pk["unlinked_tehsils"] = []
+
+          pk["counts"] = {
+              "provinces": len(provinces),
+              "districts": len(districts),
+              "tehsils": len(tehsils)
+          }
+
+          pk["administrative_source"] = {
+              "name": "Open Admin Data",
+              "url": (
+                  "https://github.com/open-admin-data/"
+                  "pakistan-administrative-divisions"
+              )
+          }
+
+          write(output / "PK.json", pk)
+
+          # Confirm Faisalabad and Jaranwala hierarchy.
+
+          jaranwala = [
+              t for t in tehsils.values()
+              if t["name"].casefold() == "jaranwala"
+          ]
+
+          assert jaranwala, "Jaranwala missing"
+
+          assert any(
+              districts[t["district_code"]]["name"]
+              .casefold() == "faisalabad"
+              for t in jaranwala
+          ), "Jaranwala district mismatch"
+
+          dialing_codes = {}
+          missing_dial = []
+
+          totals = {
+              "provinces": 0,
+              "districts": 0,
+              "tehsils": 0,
+              "unlinked_districts": 0,
+              "unlinked_tehsils": 0
+          }
+
+          for country in countries:
+              iso = country["code"]
+
+              path = output / f"{iso}.json"
+              data = read(path)
+
+              number = (
+                  phonenumbers.country_code_for_region(
+                      iso
+                  )
+              )
+
+              if number:
+                  dial = f"+{number}"
+              else:
+                  dial = ""
+
+              codes = [dial] if dial else []
+
+              country["dial"] = dial
+              country["dial_codes"] = codes
+
+              data["country"]["dial"] = dial
+              data["country"]["dial_codes"] = codes
+
+              country["counts"] = data["counts"]
+
+              for key in (
+                  "provinces",
+                  "districts",
+                  "tehsils"
+              ):
+                  totals[key] += data["counts"][key]
+
+                  country[f"has_{key}"] = (
+                      data["counts"][key] > 0
+                  )
+
+              for key in (
+                  "unlinked_districts",
+                  "unlinked_tehsils"
+              ):
+                  totals[key] += len(data.get(key, []))
+
+              dialing_codes[iso] = {
+                  "name": country["name"],
+                  "dial": dial,
+                  "dial_codes": codes
+              }
+
+              if not dial:
+                  missing_dial.append(iso)
+
+              write(path, data)
+
+          write(
+              output / "countries.json",
+              countries
+          )
+
+          write(
+              output / "dialing_codes.json",
+              dialing_codes
+          )
+
+          summary = {
+              "app": "Sukoon Matrimonial",
+              "dataset_version": "3.0-candidate",
+              "schema_version": 2,
+              "countries": len(countries),
+              **totals,
+              "pakistan": pk["counts"],
+              "pakistan_parent_validation": "passed",
+              "jaranwala_validation": "passed",
+              "countries_without_dial_code": missing_dial,
+              "phone_metadata": "phonenumbers",
+              "phone_metadata_version": (
+                  phonenumbers.__version__
+              ),
+              "administrative_sources": [
+                  "GeoNames",
+                  "Open Admin Data - Pakistan"
+              ],
+              "other_country_merges_pending": True
+          }
+
+          write(
+              output / "dataset_summary.json",
+              summary
+          )
+
+          license_file = pk_repo / "LICENSE"
+
+          assert license_file.exists()
+
+          shutil.copyfile(
+              license_file,
+              output / "LICENSE-OPEN-ADMIN-PK.txt"
+          )
+
+          attribution = output / "ATTRIBUTION.txt"
+
+          with attribution.open(
+              "a", encoding="utf-8"
+          ) as file:
+              file.write(
+                  "\nPakistan administrative data:\n"
+                  "Open Admin Data\n"
+                  "https://github.com/open-admin-data/"
+                  "pakistan-administrative-divisions\n"
+                  "Modified for Sukoon Matrimonial.\n"
+                  "See LICENSE-OPEN-ADMIN-PK.txt\n"
+                  "\nPhone metadata: phonenumbers\n"
+                  "https://github.com/daviddrysdale/"
+                  "python-phonenumbers\n"
+              )
+
+          print("SUKOON DATASET V3 REPORT")
+
+          print(json.dumps(
+              summary,
+              ensure_ascii=False,
+              indent=2
+          ))
+
+          print("Dataset generation completed.")
+          PY
+
+      - name: Upload merged dataset
+        uses: actions/upload-artifact@v7
+        with:
+          name: sukoon-locations-v3-candidate
+          path: assets/locations/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

@@ -1,0 +1,777 @@
+
+name: Intelligent Global Dataset Merge V5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  merge-global-v5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Download existing artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p inputs/base inputs/admin
+
+          for ITEM in \
+            "sukoon-locations-v4-candidate:base" \
+            "global-administrative-data:admin"
+          do
+            NAME="${ITEM%%:*}"
+            DIR="${ITEM##*:}"
+
+            ID=$(gh api --paginate \
+              "repos/$REPO/actions/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"$NAME\" and .expired == false) | .id" \
+              | sed -n '1p')
+
+            test -n "$ID"
+
+            gh api \
+              "repos/$REPO/actions/artifacts/$ID/zip" \
+              > "$DIR.zip"
+
+            unzip -q "$DIR.zip" -d "inputs/$DIR"
+          done
+
+      - name: Install metadata libraries
+        run: |
+          python3 -m pip install pycountry phonenumbers==9.0.44
+
+      - name: Intelligent record-level merge
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import shutil
+          import unicodedata
+          import pycountry
+          import phonenumbers
+
+          from pathlib import Path
+          from collections import defaultdict, Counter
+
+          def read(path):
+              return json.loads(
+                  path.read_text(encoding="utf-8")
+              )
+
+          def write(path, data):
+              path.write_text(
+                  json.dumps(
+                      data,
+                      ensure_ascii=False,
+                      separators=(",", ":")
+                  ),
+                  encoding="utf-8"
+              )
+
+          def norm(value):
+              value = unicodedata.normalize(
+                  "NFKD", str(value or "")
+              ).casefold()
+
+              value = "".join(
+                  c for c in value
+                  if not unicodedata.combining(c)
+              )
+
+              return "".join(
+                  c for c in value if c.isalnum()
+              )
+
+          def name_values(record):
+              value = record.get("name", "")
+
+              if isinstance(value, dict):
+                  return (
+                      value.get("en", ""),
+                      value.get("local", "")
+                  )
+
+              return str(value), record.get(
+                  "name_local", ""
+              )
+
+          def level_label(record):
+              value = record.get("level_name", "")
+
+              if isinstance(value, dict):
+                  value = value.get("en", "")
+
+              return str(value).strip().casefold()
+
+          def parent_id(record):
+              parent = record.get("parent")
+
+              if isinstance(parent, dict):
+                  return str(parent.get("id") or "")
+
+              return str(parent or "")
+
+          base = next(
+              Path("inputs/base").rglob("countries.json")
+          ).parent
+
+          output = Path("assets/locations")
+
+          shutil.copytree(
+              base, output, dirs_exist_ok=True
+          )
+
+          countries = read(output / "countries.json")
+
+          country_index = {
+              c["code"]: c for c in countries
+          }
+
+          country_names = {
+              norm(c["name"]): c["code"]
+              for c in countries
+          }
+
+          aliases = {
+              "united-states": "US",
+              "united-kingdom": "GB",
+              "south-korea": "KR",
+              "north-korea": "KP",
+              "turkey": "TR",
+              "russia": "RU",
+              "iran": "IR",
+              "syria": "SY",
+              "vietnam": "VN",
+              "laos": "LA",
+              "bolivia": "BO",
+              "venezuela": "VE",
+              "tanzania": "TZ",
+              "moldova": "MD",
+              "palestine": "PS",
+              "kosovo": "XK",
+              "taiwan": "TW",
+              "ivory-coast": "CI",
+              "republic-of-the-congo": "CG",
+              "dr-congo": "CD",
+              "cape-verde": "CV",
+              "micronesia": "FM",
+              "czechia": "CZ",
+              "brunei": "BN",
+              "eswatini": "SZ",
+              "saint-vincent": "VC",
+              "timor-leste": "TL",
+              "sao-tome-and-principe": "ST",
+              "south-sudan": "SS"
+          }
+
+          def get_iso(slug):
+              if slug in aliases:
+                  return aliases[slug]
+
+              if norm(slug) in country_names:
+                  return country_names[norm(slug)]
+
+              try:
+                  return pycountry.countries.lookup(
+                      slug.replace("-", " ")
+                  ).alpha_2
+              except LookupError:
+                  return None
+
+          allowed = {
+              1: {
+                  "province", "state", "region",
+                  "governorate", "department",
+                  "emirate", "prefecture", "canton",
+                  "oblast", "territory", "county",
+                  "parish", "division", "district",
+                  "federal territory",
+                  "autonomous region",
+                  "administrative region",
+                  "federal district",
+                  "administrative division"
+              },
+              2: {
+                  "district", "county", "department",
+                  "province", "prefecture",
+                  "governorate", "division",
+                  "municipal district",
+                  "administrative district",
+                  "subprovince", "sub-province",
+                  "parish", "regency",
+                  "administrative division"
+              },
+              3: {
+                  "tehsil", "tahsil", "taluk",
+                  "taluka", "taluq", "subdistrict",
+                  "sub-district", "upazila",
+                  "subcounty", "sub-county",
+                  "administrative subdistrict",
+                  "subdivision", "sub-division"
+              }
+          }
+
+          def normalized_label(label):
+              label = label.strip().casefold()
+
+              for item in allowed[1] | allowed[2] | allowed[3]:
+                  if label == item + "s":
+                      return item
+
+              return label
+
+          report = {
+              "countries": [],
+              "errors": [],
+              "unmapped": [],
+              "unknown_labels": {},
+              "orphan_repairs": [],
+              "phone_review": []
+          }
+
+          unknown_labels = Counter()
+
+          stats = Counter()
+
+          licenses = output / "licenses"
+          licenses.mkdir(exist_ok=True)
+
+          def matching(records, name):
+              target = norm(name)
+
+              return [
+                  r for r in records
+                  if target and target in {
+                      norm(r.get("name")),
+                      norm(r.get("ascii_name")),
+                      norm(r.get("name_local"))
+                  }
+              ]
+
+          def merge_record(
+              records, source, iso, level,
+              province=None, district=None
+          ):
+              english, local = name_values(source)
+
+              if not english:
+                  return None
+
+              matches = matching(records, english)
+
+              if len(matches) > 1:
+                  stats["ambiguous_matches"] += 1
+                  return None
+
+              if len(matches) == 1:
+                  item = matches[0]
+
+                  if local and not item.get("name_local"):
+                      item["name_local"] = local
+                      stats["localized_names_added"] += 1
+
+                  return item["code"]
+
+              rid = str(source["id"])
+
+              parent = district or province or "ROOT"
+
+              code = (
+                  f"OAD:{iso}:{level}:{parent}:{rid}"
+              )
+
+              existing = [
+                  r for r in records
+                  if r["code"] == code
+              ]
+
+              if existing:
+                  return None
+
+              item = {
+                  "id": code,
+                  "code": code,
+                  "local_code": rid,
+                  "name": english,
+                  "ascii_name": english,
+                  "name_local": local,
+                  "country_code": iso,
+                  "level": level,
+                  "level_name": level_label(source),
+                  "parent_id": (
+                      district or province
+                  ),
+                  "source": "Open Admin Data"
+              }
+
+              if province:
+                  item["province_code"] = province
+
+              if district:
+                  item["district_code"] = district
+
+              records.append(item)
+
+              stats[f"level_{level}_added"] += 1
+
+              return code
+
+          repos = sorted(
+              Path("inputs/admin").rglob(
+                  "*-administrative-divisions"
+              )
+          )
+
+          for repo in repos:
+              if not repo.is_dir():
+                  continue
+
+              slug = repo.name.removesuffix(
+                  "-administrative-divisions"
+              )
+
+              iso = get_iso(slug)
+
+              if not iso or iso not in country_index:
+                  report["unmapped"].append(repo.name)
+                  continue
+
+              if iso == "PK":
+                  continue
+
+              try:
+                  license_file = repo / "LICENSE"
+
+                  if not license_file.exists():
+                      raise ValueError("License missing")
+
+                  text = license_file.read_text(
+                      encoding="utf-8",
+                      errors="replace"
+                  ).lower()
+
+                  if not any(
+                      marker in text for marker in [
+                          "creative commons attribution 4.0",
+                          "cc by 4.0",
+                          "creativecommons.org/licenses/by/4.0"
+                      ]
+                  ):
+                      raise ValueError(
+                          "License requires review"
+                      )
+
+                  path = output / f"{iso}.json"
+
+                  data = read(path)
+
+                  original_stats = stats.copy()
+
+                  raw_records = {}
+
+                  paths = sorted(
+                      (repo / "data").glob("all-*.json")
+                  )
+
+                  for file in paths:
+                      raw = read(file)
+
+                      if isinstance(raw, dict):
+                          raw = raw.get("data", [])
+
+                      if not isinstance(raw, list):
+                          continue
+
+                      for record in raw:
+                          if not isinstance(record, dict):
+                              continue
+
+                          try:
+                              level = int(
+                                  record.get("level", 0)
+                              )
+                          except (TypeError, ValueError):
+                              continue
+
+                          if level not in (1, 2, 3):
+                              continue
+
+                          if not record.get("id"):
+                              continue
+
+                          label = normalized_label(
+                              level_label(record)
+                          )
+
+                          if label not in allowed[level]:
+                              unknown_labels[
+                                  f"{iso}:{level}:{label}"
+                              ] += 1
+                              continue
+
+                          key = (
+                              level,
+                              str(record["id"]),
+                              parent_id(record)
+                          )
+
+                          if key in raw_records:
+                              old = raw_records[key]
+
+                              if name_values(old) != name_values(record):
+                                  raise ValueError(
+                                      f"Conflicting names: {key}"
+                                  )
+
+                          raw_records[key] = record
+
+                  mapped = defaultdict(set)
+
+                  district_provinces = {}
+
+                  for level in (1, 2, 3):
+                      for key, record in raw_records.items():
+                          current, rid, parent = key
+
+                          if current != level:
+                              continue
+
+                          if level == 1:
+                              if parent:
+                                  stats["invalid_roots"] += 1
+                                  continue
+
+                              result = merge_record(
+                                  data["provinces"],
+                                  record, iso, 1
+                              )
+
+                          elif level == 2:
+                              parents = mapped[(1, parent)]
+
+                              if len(parents) != 1:
+                                  stats["unresolved_source_parents"] += 1
+                                  continue
+
+                              province = next(iter(parents))
+
+                              records = data["districts"].setdefault(
+                                  province, []
+                              )
+
+                              result = merge_record(
+                                  records, record, iso, 2,
+                                  province=province
+                              )
+
+                              if result:
+                                  district_provinces[result] = province
+
+                          else:
+                              parents = mapped[(2, parent)]
+
+                              if len(parents) != 1:
+                                  stats["unresolved_source_parents"] += 1
+                                  continue
+
+                              district = next(iter(parents))
+
+                              province = district_provinces[district]
+
+                              records = data["tehsils"].setdefault(
+                                  district, []
+                              )
+
+                              result = merge_record(
+                                  records, record, iso, 3,
+                                  province=province,
+                                  district=district
+                              )
+
+                          if result:
+                              mapped[(level, rid)].add(result)
+
+                  shutil.copyfile(
+                      license_file,
+                      licenses / f"{iso}-LICENSE.txt"
+                  )
+
+                  sources = data.setdefault(
+                      "additional_sources", []
+                  )
+
+                  source_url = (
+                      "https://github.com/open-admin-data/"
+                      + repo.name
+                  )
+
+                  if source_url not in sources:
+                      sources.append(source_url)
+
+                  write(path, data)
+
+                  changes = stats - original_stats
+
+                  report["countries"].append({
+                      "country": iso,
+                      "recognized_records": len(raw_records),
+                      "changes": dict(changes)
+                  })
+
+                  print("PROCESSED:", iso, dict(changes))
+
+              except Exception as error:
+                  if "original_stats" in locals():
+                      stats = original_stats.copy()
+
+                  report["errors"].append({
+                      "country": iso,
+                      "reason": str(error)
+                  })
+
+                  print("REVIEW:", iso, str(error))
+
+          totals = Counter()
+
+          dialing_codes = {}
+
+          for country in countries:
+              iso = country["code"]
+
+              path = output / f"{iso}.json"
+
+              data = read(path)
+
+              province_ids = {
+                  r["code"] for r in data["provinces"]
+              }
+
+              districts = {}
+
+              for province, records in data["districts"].items():
+                  assert province in province_ids
+
+                  for record in records:
+                      rid = record["code"]
+
+                      assert rid not in districts
+
+                      districts[rid] = province
+
+              # Repair only exact existing parent IDs.
+              # Never guess a district from a similar name.
+
+              remaining = []
+
+              for record in data.get("unlinked_tehsils", []):
+                  district = record.get("district_code")
+
+                  if district not in districts:
+                      remaining.append(record)
+                      continue
+
+                  province = districts[district]
+
+                  old_province = record.get("province_code")
+
+                  if old_province and old_province != province:
+                      remaining.append(record)
+                      continue
+
+                  group = data["tehsils"].setdefault(
+                      district, []
+                  )
+
+                  if any(
+                      r["code"] == record["code"]
+                      for r in group
+                  ):
+                      remaining.append(record)
+                      continue
+
+                  record["province_code"] = province
+                  record["district_code"] = district
+
+                  group.append(record)
+
+                  stats["orphan_tehsils_repaired"] += 1
+
+              data["unlinked_tehsils"] = remaining
+
+              seen = set(province_ids)
+
+              assert len(seen) == len(data["provinces"])
+
+              for rid in districts:
+                  assert rid not in seen
+                  seen.add(rid)
+
+              linked_tehsils = 0
+
+              for district, records in data["tehsils"].items():
+                  assert district in districts
+
+                  for record in records:
+                      rid = record["code"]
+
+                      assert rid not in seen
+
+                      seen.add(rid)
+
+                      linked_tehsils += 1
+
+              counts = {
+                  "provinces": len(province_ids),
+                  "districts": (
+                      len(districts)
+                      + len(data.get("unlinked_districts", []))
+                  ),
+                  "tehsils": (
+                      linked_tehsils + len(remaining)
+                  )
+              }
+
+              data["counts"] = counts
+              country["counts"] = counts
+
+              for key, count in counts.items():
+                  totals[key] += count
+
+                  country[f"has_{key}"] = count > 0
+
+              totals["unlinked_tehsils"] += len(remaining)
+
+              totals["unlinked_districts"] += len(
+                  data.get("unlinked_districts", [])
+              )
+
+              dial_number = (
+                  phonenumbers.country_code_for_region(iso)
+              )
+
+              dial = f"+{dial_number}" if dial_number else ""
+
+              if not dial:
+                  report["phone_review"].append({
+                      "country": iso,
+                      "name": country["name"],
+                      "reason": "No region calling code in metadata"
+                  })
+
+              country["dial"] = dial
+              country["dial_codes"] = [dial] if dial else []
+
+              data["country"]["dial"] = dial
+              data["country"]["dial_codes"] = country["dial_codes"]
+
+              dialing_codes[iso] = {
+                  "name": country["name"],
+                  "dial": dial,
+                  "dial_codes": country["dial_codes"]
+              }
+
+              write(path, data)
+
+          write(output / "countries.json", countries)
+
+          write(
+              output / "dialing_codes.json",
+              dialing_codes
+          )
+
+          report["unknown_labels"] = dict(
+              unknown_labels
+          )
+
+          pk = read(output / "PK.json")
+
+          assert pk["counts"] == {
+              "provinces": 7,
+              "districts": 160,
+              "tehsils": 577
+          }
+
+          assert len(countries) == 250
+
+          summary = {
+              "app": "Sukoon Matrimonial",
+              "dataset_version": "5.0-candidate",
+              "schema_version": 2,
+              "countries": len(countries),
+              **dict(totals),
+              "pakistan": pk["counts"],
+              "repositories_found": len(repos),
+              "countries_processed": len(report["countries"]),
+              "countries_requiring_review": len(report["errors"]),
+              "unmapped_repositories": len(report["unmapped"]),
+              "merge_statistics": dict(stats),
+              "unknown_administrative_labels": len(unknown_labels),
+              "countries_without_dial_code": [
+                  r["country"] for r in report["phone_review"]
+              ],
+              "linked_hierarchy_validation": "passed",
+              "release_ready": False
+          }
+
+          write(
+              output / "dataset_summary.json",
+              summary
+          )
+
+          write(
+              output / "global_merge_v5_report.json",
+              report
+          )
+
+          with (output / "ATTRIBUTION.txt").open(
+              "a", encoding="utf-8"
+          ) as file:
+              file.write(
+                  "\n\nVersion 5 additional sources:\n"
+              )
+
+              for item in report["countries"]:
+                  iso = item["country"]
+
+                  data = read(output / f"{iso}.json")
+
+                  for url in data.get("additional_sources", []):
+                      file.write(
+                          f"{iso}: {url}\n"
+                          f"Modified for Sukoon Matrimonial.\n"
+                          f"License: licenses/{iso}-LICENSE.txt\n"
+                      )
+
+          print("SUKOON DATASET V5 REPORT")
+
+          print(json.dumps(
+              summary,
+              ensure_ascii=False,
+              indent=2
+          ))
+
+          print("UNKNOWN ADMINISTRATIVE LABELS")
+
+          print(json.dumps(
+              dict(unknown_labels),
+              ensure_ascii=False,
+              indent=2
+          ))
+
+          print("Dataset generation completed.")
+          PY
+
+      - name: Upload Version 5 dataset
+        uses: actions/upload-artifact@v7
+        with:
+          name: sukoon-locations-v5-candidate
+          path: assets/locations/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

@@ -1,0 +1,183 @@
+
+name: Inspect Global Location Data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect-locations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Download existing datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p inputs/geonames inputs/admin
+
+          for ITEM in \
+            "sukoon-offline-locations:geonames" \
+            "global-administrative-data:admin"
+          do
+            NAME="${ITEM%%:*}"
+            DIR="${ITEM##*:}"
+
+            ID=$(gh api --paginate \
+              "repos/$REPO/actions/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"$NAME\" and .expired == false) | .id" \
+              | head -n 1)
+
+            if [ -z "$ID" ]; then
+              echo "Artifact not found: $NAME"
+              exit 1
+            fi
+
+            gh api \
+              "repos/$REPO/actions/artifacts/$ID/zip" \
+              > "$DIR.zip"
+
+            unzip -q "$DIR.zip" -d "inputs/$DIR"
+          done
+
+      - name: Inspect country datasets
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from collections import Counter
+
+          root = Path("inputs/admin")
+          report = []
+
+          for repo in sorted(
+              root.rglob("*-administrative-divisions")
+          ):
+              if not repo.is_dir():
+                  continue
+
+              files = list(repo.rglob("*.json"))
+              aggregates = []
+              licenses = []
+
+              for path in repo.rglob("*"):
+                  if path.is_file() and \
+                     path.name.lower().startswith("license"):
+                      licenses.append(str(path.relative_to(repo)))
+
+              for path in files:
+                  name = path.name.lower()
+
+                  if not (
+                      name.startswith("all-")
+                      or name.startswith("all_")
+                      or name == "hierarchy.json"
+                  ):
+                      continue
+
+                  try:
+                      data = json.loads(
+                          path.read_text(encoding="utf-8")
+                      )
+
+                      sample = (
+                          data[0]
+                          if isinstance(data, list) and data
+                          else data
+                      )
+
+                      keys = (
+                          list(sample.keys())
+                          if isinstance(sample, dict)
+                          else []
+                      )
+
+                      aggregates.append({
+                          "file": str(path.relative_to(repo)),
+                          "type": type(data).__name__,
+                          "count": len(data)
+                          if isinstance(data, (list, dict))
+                          else None,
+                          "fields": keys,
+                          "sample": sample
+                          if isinstance(data, list)
+                          else None
+                      })
+
+                  except Exception as error:
+                      aggregates.append({
+                          "file": str(path),
+                          "error": str(error)
+                      })
+
+              report.append({
+                  "repository": repo.name,
+                  "json_files": len(files),
+                  "licenses": licenses,
+                  "aggregate_files": aggregates
+              })
+
+          if not report:
+              raise RuntimeError("No country datasets found")
+
+          summaries = list(
+              Path("inputs/geonames").rglob(
+                  "dataset_summary.json"
+              )
+          )
+
+          if not summaries:
+              raise RuntimeError("GeoNames summary missing")
+
+          geonames = json.loads(
+              summaries[0].read_text(encoding="utf-8")
+          )
+
+          result = {
+              "geonames": geonames,
+              "repositories": len(report),
+              "countries": report
+          }
+
+          Path("location_inspection.json").write_text(
+              json.dumps(
+                  result,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
+
+          print("LOCATION INSPECTION REPORT")
+          print("Repositories:", len(report))
+          print("JSON files:", sum(
+              r["json_files"] for r in report
+          ))
+          print("Repositories with aggregate files:", sum(
+              bool(r["aggregate_files"]) for r in report
+          ))
+
+          for country in report:
+              if country["repository"].startswith("pakistan-"):
+                  print("PAKISTAN STRUCTURE")
+                  print(json.dumps(
+                      country,
+                      ensure_ascii=False,
+                      indent=2
+                  ))
+
+          print("Inspection completed.")
+          PY
+
+      - name: Upload inspection report
+        uses: actions/upload-artifact@v7
+        with:
+          name: location-inspection-report
+          path: location_inspection.json
+          retention-days: 30
+          if-no-files-found: error

@@ -1,0 +1,346 @@
+name: Analyze Sukoon Global Locations
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  analyze-locations:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download original location database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 45610896275 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name sukoon-final-location-base \
+            --dir source_data
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Merge and analyze location data
+        run: |
+          python <<'PYTHON'
+          import json
+          from pathlib import Path
+          from collections import Counter
+
+          source = Path("source_data")
+          output = Path("analysis_output")
+          output.mkdir(exist_ok=True)
+
+          all_files = {}
+          country_reports = []
+          errors = []
+          totals = Counter()
+
+          def records(value):
+              if isinstance(value, list):
+                  return [
+                      item for item in value
+                      if isinstance(item, dict)
+                  ]
+              return []
+
+          def grouped(value):
+              if not isinstance(value, dict):
+                  return {}
+              return {
+                  str(key): records(items)
+                  for key, items in value.items()
+              }
+
+          def codes(items):
+              return {
+                  str(item.get("code"))
+                  for item in items
+                  if item.get("code")
+              }
+
+          def count_group(value):
+              return sum(
+                  len(items)
+                  for items in value.values()
+              )
+
+          def sample_names(items):
+              return [
+                  item.get("name", "")
+                  for item in items[:5]
+              ]
+
+          def field_names(items):
+              result = set()
+              for item in items:
+                  result.update(item.keys())
+              return sorted(result)
+
+          files = sorted(source.rglob("*.json"))
+
+          if not files:
+              raise RuntimeError(
+                  "No JSON files found"
+              )
+
+          for path in files:
+              relative = path.relative_to(
+                  source
+              ).as_posix()
+
+              try:
+                  data = json.loads(
+                      path.read_text(
+                          encoding="utf-8-sig"
+                      )
+                  )
+              except Exception as error:
+                  errors.append({
+                      "file": relative,
+                      "error": str(error)
+                  })
+                  continue
+
+              all_files[relative] = data
+
+              if not isinstance(data, dict):
+                  continue
+
+              country = data.get("country")
+
+              if not isinstance(country, dict):
+                  continue
+
+              country_code = country.get("code")
+
+              if not country_code:
+                  continue
+
+              provinces = records(
+                  data.get("provinces")
+              )
+
+              districts = grouped(
+                  data.get("districts")
+              )
+
+              tehsils = grouped(
+                  data.get("tehsils")
+              )
+
+              district_records = [
+                  item
+                  for items in districts.values()
+                  for item in items
+              ]
+
+              tehsil_records = [
+                  item
+                  for items in tehsils.values()
+                  for item in items
+              ]
+
+              province_codes = codes(provinces)
+              district_codes = codes(
+                  district_records
+              )
+
+              invalid_district_parents = [
+                  key for key in districts
+                  if key not in province_codes
+              ]
+
+              invalid_tehsil_parents = [
+                  key for key in tehsils
+                  if key not in district_codes
+              ]
+
+              unlinked_districts = records(
+                  data.get("unlinked_districts")
+              )
+
+              unlinked_tehsils = records(
+                  data.get("unlinked_tehsils")
+              )
+
+              province_count = len(provinces)
+
+              district_count = count_group(
+                  districts
+              )
+
+              tehsil_count = count_group(
+                  tehsils
+              )
+
+              report = {
+                  "file": relative,
+                  "country_code": country_code,
+                  "country_name": country.get(
+                      "name", ""
+                  ),
+                  "schema_version": data.get(
+                      "schema_version"
+                  ),
+                  "country_metadata": country,
+                  "available_levels": {
+                      "level_1": province_count > 0,
+                      "level_2": district_count > 0,
+                      "level_3": tehsil_count > 0
+                  },
+                  "counts": {
+                      "level_1": province_count,
+                      "level_2": district_count,
+                      "level_3": tehsil_count,
+                      "unlinked_districts": len(
+                          unlinked_districts
+                      ),
+                      "unlinked_tehsils": len(
+                          unlinked_tehsils
+                      )
+                  },
+                  "invalid_district_parent_codes":
+                      invalid_district_parents,
+                  "invalid_tehsil_parent_codes":
+                      invalid_tehsil_parents,
+                  "provinces_without_districts": [
+                      code
+                      for code in sorted(province_codes)
+                      if not districts.get(code)
+                  ],
+                  "districts_without_tehsils": [
+                      code
+                      for code in sorted(district_codes)
+                      if not tehsils.get(code)
+                  ],
+                  "sample_names": {
+                      "level_1": sample_names(
+                          provinces
+                      ),
+                      "level_2": sample_names(
+                          district_records
+                      ),
+                      "level_3": sample_names(
+                          tehsil_records
+                      )
+                  },
+                  "record_fields": {
+                      "level_1": field_names(
+                          provinces
+                      ),
+                      "level_2": field_names(
+                          district_records
+                      ),
+                      "level_3": field_names(
+                          tehsil_records
+                      )
+                  },
+                  "original_counts": data.get(
+                      "counts", {}
+                  )
+              }
+
+              country_reports.append(report)
+
+              totals["countries"] += 1
+              totals["level_1"] += province_count
+              totals["level_2"] += district_count
+              totals["level_3"] += tehsil_count
+
+              totals["unlinked_districts"] += len(
+                  unlinked_districts
+              )
+
+              totals["unlinked_tehsils"] += len(
+                  unlinked_tehsils
+              )
+
+              totals["invalid_district_parents"] += len(
+                  invalid_district_parents
+              )
+
+              totals["invalid_tehsil_parents"] += len(
+                  invalid_tehsil_parents
+              )
+
+          if not country_reports:
+              raise RuntimeError(
+                  "No country records recognized"
+              )
+
+          country_reports.sort(
+              key=lambda item: item["country_code"]
+          )
+
+          combined = {
+              "format_version": 1,
+              "json_file_count": len(all_files),
+              "files": all_files
+          }
+
+          analysis = {
+              "format_version": 1,
+              "json_files_found": len(files),
+              "json_files_read": len(all_files),
+              "totals": dict(totals),
+              "errors": errors,
+              "countries": country_reports
+          }
+
+          (output / "all_locations.json").write_text(
+              json.dumps(
+                  combined,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              ),
+              encoding="utf-8"
+          )
+
+          (output / "location_analysis.json").write_text(
+              json.dumps(
+                  analysis,
+                  ensure_ascii=False,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
+
+          print("LOCATION_ANALYSIS_COMPLETE")
+
+          print(
+              json.dumps(
+                  dict(totals),
+                  indent=2
+              )
+          )
+
+          print("JSON files:", len(all_files))
+          print("Read errors:", len(errors))
+
+          if errors:
+              raise RuntimeError(
+                  "Some JSON files could not be read"
+              )
+
+          PYTHON
+
+      - name: Upload complete location database
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukoon-all-locations
+          path: analysis_output/all_locations.json
+          retention-days: 30
+
+      - name: Upload location analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukoon-location-analysis
+          path: analysis_output/location_analysis.json
+          retention-days: 30
